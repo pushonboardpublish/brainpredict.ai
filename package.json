@@ -1,0 +1,952 @@
+import React, { useState, useRef, useEffect, useCallback } from "react";
+import { LineChart, Line, XAxis, YAxis, CartesianGrid, ResponsiveContainer, Tooltip } from "recharts";
+
+// ---------------------------------------------------------------------------
+// BrainPredict.ai — unified demo
+// Three prediction modes living under one shell:
+//   1. Signal   — simulated neural-waveform extrapolation (no real EEG/fMRI
+//                 hardware exists here, so this is an honest simulation,
+//                 labeled as such)
+//   2. Language — real LLM-based prediction via the Claude API
+//   3. Field    — architecture notes on how real brain-signal ingestion
+//                 would plug into this same pipeline
+// ---------------------------------------------------------------------------
+
+const FONT_IMPORT = `@import url('https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,600&family=IBM+Plex+Mono:wght@400;500&family=Inter:wght@400;500;600&display=swap');`;
+
+const COLORS = {
+  bg: "#0B0F14",
+  panel: "#111826",
+  panelAlt: "#0E1420",
+  line: "#1E293B",
+  signal: "#5EEAD4",
+  signalDim: "#2C6E64",
+  amber: "#F5A623",
+  text: "#E7ECF2",
+  textDim: "#8A97A8",
+};
+
+function useNeuralSeries(length = 60) {
+  // deterministic-ish synthetic waveform: sum of a few sines + noise,
+  // standing in for a raw signal channel. Clearly a simulation.
+  const [series, setSeries] = useState(() => {
+    const arr = [];
+    for (let i = 0; i < length; i++) {
+      const t = i / 6;
+      const v =
+        Math.sin(t) * 1.2 +
+        Math.sin(t * 2.7 + 1) * 0.6 +
+        Math.sin(t * 0.4) * 0.8 +
+        (Math.random() - 0.5) * 0.4;
+      arr.push({ i, v: Number(v.toFixed(3)), kind: "observed" });
+    }
+    return arr;
+  });
+  return [series, setSeries];
+}
+
+function extrapolate(series, steps = 20) {
+  // naive linear + harmonic continuation of the last window — a stand-in
+  // "predictor" so the UI has something to extend the line with.
+  const tail = series.slice(-12);
+  const avgDelta =
+    tail.reduce((acc, p, idx) => {
+      if (idx === 0) return acc;
+      return acc + (p.v - tail[idx - 1].v);
+    }, 0) / (tail.length - 1);
+
+  const last = series[series.length - 1];
+  const out = [];
+  let prevV = last.v;
+  for (let k = 1; k <= steps; k++) {
+    const t = (last.i + k) / 6;
+    const harmonic = Math.sin(t) * 1.2 + Math.sin(t * 2.7 + 1) * 0.6;
+    const v = prevV * 0.55 + harmonic * 0.45 + avgDelta * 0.2;
+    prevV = v;
+    out.push({ i: last.i + k, v: Number(v.toFixed(3)), kind: "predicted" });
+  }
+  return out;
+}
+
+async function callClaude(prompt) {
+  const response = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: "claude-sonnet-4-6",
+      max_tokens: 1000,
+      messages: [{ role: "user", content: prompt }],
+    }),
+  });
+  const data = await response.json();
+  const text = (data.content || [])
+    .filter((b) => b.type === "text")
+    .map((b) => b.text)
+    .join("\n");
+  return text || "(no response)";
+}
+
+async function callClaudeVision(base64Image, prompt) {
+  const response = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: "claude-sonnet-4-6",
+      max_tokens: 300,
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "image", source: { type: "base64", media_type: "image/jpeg", data: base64Image } },
+            { type: "text", text: prompt },
+          ],
+        },
+      ],
+    }),
+  });
+  const data = await response.json();
+  const text = (data.content || [])
+    .filter((b) => b.type === "text")
+    .map((b) => b.text)
+    .join("\n");
+  return text || "(no response)";
+}
+
+async function pushLog(key, entry, max = 15) {
+  try {
+    let existing = [];
+    try {
+      const res = await window.storage.get(key, false);
+      if (res && res.value) existing = JSON.parse(res.value);
+    } catch (e) {
+      existing = [];
+    }
+    const updated = [entry, ...existing].slice(0, max);
+    await window.storage.set(key, JSON.stringify(updated), false);
+    return updated;
+  } catch (e) {
+    return null;
+  }
+}
+
+async function readLog(key) {
+  try {
+    const res = await window.storage.get(key, false);
+    if (res && res.value) return JSON.parse(res.value);
+    return [];
+  } catch (e) {
+    return [];
+  }
+}
+
+async function recordPatternOccurrence(category) {
+  let counts = {};
+  try {
+    const res = await window.storage.get("evolve:pattern-counts", false);
+    if (res && res.value) counts = JSON.parse(res.value);
+  } catch (e) {
+    counts = {};
+  }
+  counts[category] = (counts[category] || 0) + 1;
+  try {
+    await window.storage.set("evolve:pattern-counts", JSON.stringify(counts), false);
+  } catch (e) {
+    // best effort — a missed write just means this one occurrence isn't counted
+  }
+  return counts[category];
+}
+
+function PerceptionPanel() {
+  const videoRef = useRef(null);
+  const canvasRef = useRef(null);
+  const intervalRef = useRef(null);
+  const [active, setActive] = useState(false);
+  const [error, setError] = useState("");
+  const [log, setLog] = useState([]);
+  const [busy, setBusy] = useState(false);
+
+  const captureAndAnalyze = useCallback(async () => {
+    if (!videoRef.current || !canvasRef.current || busy) return;
+    const video = videoRef.current;
+    const canvas = canvasRef.current;
+    if (!video.videoWidth) return;
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    const ctx = canvas.getContext("2d");
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+    const base64 = canvas.toDataURL("image/jpeg", 0.6).split(",")[1];
+    setBusy(true);
+    try {
+      const raw = await callClaudeVision(
+        base64,
+        `Look at this frame. Respond with ONLY JSON, no markdown fences: {"category": a 2-4 word tag classifying the type of scene or subject, "description": one short sentence on what's visible, "prediction": one short sentence predicting what happens or changes next}.`
+      );
+      const clean = raw.replace(/```json|```/g, "").trim();
+      let parsed;
+      try {
+        parsed = JSON.parse(clean);
+      } catch (e) {
+        parsed = { category: "uncategorized", description: raw, prediction: "" };
+      }
+      const occurrence = await recordPatternOccurrence(parsed.category);
+      const entry = {
+        time: new Date().toLocaleTimeString(),
+        text: `${parsed.description} ${parsed.prediction}`.trim(),
+        category: parsed.category,
+        occurrence,
+      };
+      setLog((prev) => [entry, ...prev].slice(0, 8));
+      pushLog("evolve:observations", entry);
+    } catch (e) {
+      setLog((prev) => [{ time: new Date().toLocaleTimeString(), text: "Analysis failed for this frame." }, ...prev].slice(0, 8));
+    } finally {
+      setBusy(false);
+    }
+  }, [busy]);
+
+  const start = async () => {
+    setError("");
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ video: true });
+      if (videoRef.current) videoRef.current.srcObject = stream;
+      setActive(true);
+      intervalRef.current = setInterval(captureAndAnalyze, 6000);
+    } catch (e) {
+      setError("Camera access was denied or isn't available in this environment.");
+    }
+  };
+
+  const stop = () => {
+    setActive(false);
+    clearInterval(intervalRef.current);
+    const stream = videoRef.current && videoRef.current.srcObject;
+    if (stream) stream.getTracks().forEach((t) => t.stop());
+  };
+
+  useEffect(() => () => stop(), []);
+
+  return (
+    <div>
+      <p style={{ color: COLORS.textDim, fontFamily: "Inter, sans-serif", fontSize: 13.5, lineHeight: 1.6, maxWidth: 540 }}>
+        Worth naming directly: a quantum mainframe isn't something any
+        software build can provide — that's specialized physical hardware,
+        not code. What's actually buildable, and what this panel does, is
+        the real version of "continuously read the surroundings and reason
+        about them": your camera feed, sampled every few seconds, sent to a
+        vision-capable model that describes the scene and predicts what
+        happens next. That loop is a genuine agentic pipeline, just running
+        on ordinary compute rather than quantum.
+      </p>
+      <p style={{ color: COLORS.textDim, fontFamily: "Inter, sans-serif", fontSize: 13.5, lineHeight: 1.6, maxWidth: 540, marginTop: 10 }}>
+        Each frame is also tagged with a scene category and checked against
+        how many times that category has come up before — the same shape as
+        a paramedic recognizing a face they've seen present the same way
+        multiple times. A count of 2 or more on a tag shows up as
+        "recognized" below.
+      </p>
+      <div style={{ marginTop: 16, display: "flex", gap: 16, alignItems: "flex-start", flexWrap: "wrap" }}>
+        <div style={{ background: "#000", borderRadius: 4, overflow: "hidden", width: 220, height: 165, flexShrink: 0 }}>
+          <video ref={videoRef} autoPlay muted playsInline style={{ width: "100%", height: "100%", objectFit: "cover" }} />
+        </div>
+        <canvas ref={canvasRef} style={{ display: "none" }} />
+        <div style={{ flex: 1, minWidth: 200 }}>
+          <button
+            onClick={active ? stop : start}
+            style={{
+              background: active ? "transparent" : COLORS.signal,
+              color: active ? COLORS.text : "#08201C",
+              border: active ? `1px solid ${COLORS.line}` : "none",
+              borderRadius: 3,
+              padding: "9px 16px",
+              fontFamily: "Inter, sans-serif",
+              fontWeight: 600,
+              fontSize: 13,
+              cursor: "pointer",
+            }}
+          >
+            {active ? "Stop watching" : "Start watching"}
+          </button>
+          {error && <p style={{ color: "#F87171", fontSize: 12.5, marginTop: 10, fontFamily: "Inter, sans-serif" }}>{error}</p>}
+          {active && <p style={{ color: COLORS.textDim, fontSize: 12, marginTop: 10, fontFamily: "IBM Plex Mono, monospace" }}>sampling every 6s{busy ? " · analyzing…" : ""}</p>}
+        </div>
+      </div>
+      <div style={{ marginTop: 18 }}>
+        {log.length === 0 && (
+          <p style={{ color: COLORS.textDim, fontSize: 12.5, fontFamily: "Inter, sans-serif" }}>No observations yet.</p>
+        )}
+        {log.map((entry, idx) => (
+          <div key={idx} style={{ borderTop: `1px solid ${COLORS.line}`, padding: "10px 0", display: "flex", gap: 14 }}>
+            <div style={{ fontFamily: "IBM Plex Mono, monospace", fontSize: 11, color: COLORS.signalDim, flexShrink: 0, width: 68 }}>
+              {entry.time}
+            </div>
+            <div style={{ flex: 1 }}>
+              {entry.occurrence >= 2 && (
+                <div style={{ fontFamily: "IBM Plex Mono, monospace", fontSize: 10.5, color: COLORS.amber, marginBottom: 3 }}>
+                  recognized ×{entry.occurrence} · {entry.category}
+                </div>
+              )}
+              <div style={{ fontFamily: "Inter, sans-serif", fontSize: 13, color: COLORS.text, lineHeight: 1.5 }}>{entry.text}</div>
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function EvolvePanel() {
+  const [loading, setLoading] = useState(false);
+  const [suggestions, setSuggestions] = useState([]);
+  const [applied, setApplied] = useState(null);
+  const [error, setError] = useState("");
+  const [counts, setCounts] = useState({ observations: 0, predictions: 0, signals: 0 });
+
+  useEffect(() => {
+    (async () => {
+      const [o, p, s] = await Promise.all([
+        readLog("evolve:observations"),
+        readLog("evolve:predictions"),
+        readLog("evolve:signals"),
+      ]);
+      setCounts({ observations: o.length, predictions: p.length, signals: s.length });
+    })();
+  }, [suggestions]);
+
+  const analyze = async () => {
+    setLoading(true);
+    setError("");
+    setApplied(null);
+    try {
+      const [observations, predictions, signals] = await Promise.all([
+        readLog("evolve:observations"),
+        readLog("evolve:predictions"),
+        readLog("evolve:signals"),
+      ]);
+      let patternCounts = {};
+      try {
+        const res = await window.storage.get("evolve:pattern-counts", false);
+        if (res && res.value) patternCounts = JSON.parse(res.value);
+      } catch (e) {
+        patternCounts = {};
+      }
+      const context = JSON.stringify({
+        observations: observations.slice(0, 5),
+        predictions: predictions.slice(0, 5),
+        signals: signals.slice(0, 5),
+        recognizedPatterns: patternCounts,
+      });
+      const prompt = `You are the self-improvement engine for an app called brainpredict.ai, which has three channels: Signal (waveform extrapolation), Language (LLM text continuation), and Perception (camera + vision analysis). Here is recent usage history: ${context}. Based on this activity (or its absence), propose exactly 3 concrete, specific upgrade suggestions for the app. Respond with ONLY a JSON array, no prose, no markdown fences, each item shaped like {"title": string, "rationale": string, "impact": 1-3}.`;
+      const raw = await callClaude(prompt);
+      const clean = raw.replace(/```json|```/g, "").trim();
+      let parsed = [];
+      try {
+        parsed = JSON.parse(clean);
+      } catch (e) {
+        parsed = [];
+      }
+      parsed.sort((a, b) => (b.impact || 0) - (a.impact || 0));
+      setSuggestions(parsed);
+    } catch (e) {
+      setError("Couldn't analyze activity — check your connection and try again.");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const applyTop = () => {
+    if (suggestions.length === 0) return;
+    setApplied(suggestions[0]);
+    pushLog("evolve:applied", { time: new Date().toLocaleTimeString(), title: suggestions[0].title });
+  };
+
+  const total = counts.observations + counts.predictions + counts.signals;
+
+  return (
+    <div>
+      <p style={{ color: COLORS.textDim, fontFamily: "Inter, sans-serif", fontSize: 13.5, lineHeight: 1.6, maxWidth: 550 }}>
+        This is what "self-evolving" can honestly mean here: every
+        prediction across the three channels is saved, and this panel
+        reads that accumulated history to propose upgrades grounded in
+        actual usage — not a claim that the code rewrites itself
+        unsupervised. Applying a suggestion queues it; I build it in our
+        next exchange, same as any other change to this repo.
+      </p>
+      <p style={{ fontFamily: "IBM Plex Mono, monospace", fontSize: 11.5, color: COLORS.signalDim, marginTop: 12 }}>
+        {total} logged events · {counts.observations} perception · {counts.predictions} language · {counts.signals} signal
+      </p>
+      <button
+        onClick={analyze}
+        disabled={loading}
+        style={{
+          marginTop: 14,
+          background: COLORS.signal,
+          color: "#08201C",
+          border: "none",
+          borderRadius: 3,
+          padding: "9px 16px",
+          fontFamily: "Inter, sans-serif",
+          fontWeight: 600,
+          fontSize: 13,
+          cursor: loading ? "default" : "pointer",
+          opacity: loading ? 0.6 : 1,
+        }}
+      >
+        {loading ? "Analyzing…" : "Analyze activity & suggest upgrades"}
+      </button>
+      {error && <p style={{ color: "#F87171", fontSize: 13, marginTop: 12, fontFamily: "Inter, sans-serif" }}>{error}</p>}
+      {suggestions.length > 0 && (
+        <div style={{ marginTop: 18 }}>
+          {suggestions.map((s, idx) => (
+            <div
+              key={idx}
+              style={{
+                borderTop: idx === 0 ? `1px solid ${COLORS.line}` : "none",
+                borderBottom: `1px solid ${COLORS.line}`,
+                padding: "12px 0",
+              }}
+            >
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
+                <div style={{ fontFamily: "Fraunces, serif", fontWeight: 600, fontSize: 15.5, color: COLORS.text }}>
+                  {idx === 0 && <span style={{ color: COLORS.amber, fontSize: 11, fontFamily: "IBM Plex Mono, monospace", marginRight: 8 }}>recommended</span>}
+                  {s.title}
+                </div>
+                <div style={{ fontFamily: "IBM Plex Mono, monospace", fontSize: 11, color: COLORS.textDim }}>impact {s.impact}/3</div>
+              </div>
+              <p style={{ color: COLORS.textDim, fontSize: 13, marginTop: 6, lineHeight: 1.5, fontFamily: "Inter, sans-serif" }}>{s.rationale}</p>
+              {idx === 0 && !applied && (
+                <button
+                  onClick={applyTop}
+                  style={{
+                    marginTop: 8,
+                    background: "transparent",
+                    border: `1px solid ${COLORS.signal}`,
+                    color: COLORS.signal,
+                    borderRadius: 3,
+                    padding: "6px 12px",
+                    fontFamily: "Inter, sans-serif",
+                    fontWeight: 600,
+                    fontSize: 12.5,
+                    cursor: "pointer",
+                  }}
+                >
+                  Apply best
+                </button>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+      {applied && (
+        <p style={{ marginTop: 14, color: COLORS.signal, fontFamily: "Inter, sans-serif", fontSize: 13 }}>
+          Queued: "{applied.title}" — ask to build it next and it becomes the next change to this repo.
+        </p>
+      )}
+    </div>
+  );
+}
+
+function PhoneSensorsPanel() {
+  const [motionActive, setMotionActive] = useState(false);
+  const [motionSeries, setMotionSeries] = useState([]);
+  const [motionError, setMotionError] = useState("");
+  const motionCounterRef = useRef(0);
+
+  const handleMotion = useCallback((e) => {
+    const acc = e.accelerationIncludingGravity || e.acceleration;
+    if (!acc) return;
+    const magnitude = Math.sqrt((acc.x || 0) ** 2 + (acc.y || 0) ** 2 + (acc.z || 0) ** 2);
+    motionCounterRef.current += 1;
+    setMotionSeries((prev) => [...prev.slice(-79), { i: motionCounterRef.current, v: Number(magnitude.toFixed(2)) }]);
+  }, []);
+
+  const startMotion = async () => {
+    setMotionError("");
+    try {
+      if (typeof DeviceMotionEvent !== "undefined" && typeof DeviceMotionEvent.requestPermission === "function") {
+        const perm = await DeviceMotionEvent.requestPermission();
+        if (perm !== "granted") {
+          setMotionError("Motion permission was denied.");
+          return;
+        }
+      }
+      window.addEventListener("devicemotion", handleMotion);
+      setMotionActive(true);
+    } catch (e) {
+      setMotionError("Motion sensors aren't available in this environment.");
+    }
+  };
+
+  const stopMotion = useCallback(() => {
+    window.removeEventListener("devicemotion", handleMotion);
+    setMotionActive(false);
+  }, [handleMotion]);
+
+  useEffect(() => () => window.removeEventListener("devicemotion", handleMotion), [handleMotion]);
+
+  const videoRef = useRef(null);
+  const canvasRef = useRef(null);
+  const hrIntervalRef = useRef(null);
+  const hrTimeoutRef = useRef(null);
+  const samplesRef = useRef([]);
+  const [hrActive, setHrActive] = useState(false);
+  const [hrError, setHrError] = useState("");
+  const [bpm, setBpm] = useState(null);
+
+  const sampleFrame = () => {
+    const video = videoRef.current;
+    const canvas = canvasRef.current;
+    if (!video || !canvas || !video.videoWidth) return;
+    canvas.width = 20;
+    canvas.height = 20;
+    const ctx = canvas.getContext("2d");
+    ctx.drawImage(video, 0, 0, 20, 20);
+    const data = ctx.getImageData(0, 0, 20, 20).data;
+    let sum = 0;
+    for (let i = 0; i < data.length; i += 4) sum += data[i];
+    samplesRef.current.push(sum / (data.length / 4));
+  };
+
+  const stopHr = useCallback((stopTracks) => {
+    setHrActive(false);
+    clearInterval(hrIntervalRef.current);
+    if (stopTracks) {
+      const stream = videoRef.current && videoRef.current.srcObject;
+      if (stream) stream.getTracks().forEach((t) => t.stop());
+    }
+  }, []);
+
+  const computeBpm = useCallback(() => {
+    const samples = samplesRef.current;
+    stopHr(true);
+    if (samples.length < 20) {
+      setHrError("Not enough signal — try again with your fingertip fully covering the lens and flash.");
+      return;
+    }
+    const mean = samples.reduce((a, b) => a + b, 0) / samples.length;
+    let peaks = 0;
+    for (let i = 1; i < samples.length; i++) {
+      if (samples[i] > mean && samples[i - 1] <= mean) peaks++;
+    }
+    const seconds = samples.length * 0.1;
+    const estimate = Math.round((peaks / seconds) * 60);
+    if (estimate < 30 || estimate > 220) {
+      setHrError("Reading looked unreliable — hold your fingertip still over the lens and try again.");
+    } else {
+      setBpm(estimate);
+      pushLog("evolve:signals", { time: new Date().toLocaleTimeString(), note: `phone camera heart-rate estimate: ${estimate} bpm` });
+    }
+  }, [stopHr]);
+
+  const startHr = async () => {
+    setHrError("");
+    setBpm(null);
+    samplesRef.current = [];
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } });
+      const track = stream.getVideoTracks()[0];
+      try {
+        await track.applyConstraints({ advanced: [{ torch: true }] });
+      } catch (e) {
+        // torch not supported on this device/browser — reading will be less reliable without it
+      }
+      if (videoRef.current) videoRef.current.srcObject = stream;
+      setHrActive(true);
+      hrIntervalRef.current = setInterval(sampleFrame, 100);
+      hrTimeoutRef.current = setTimeout(computeBpm, 15000);
+    } catch (e) {
+      setHrError("Camera access was denied or isn't available.");
+    }
+  };
+
+  useEffect(() => () => { stopHr(true); clearTimeout(hrTimeoutRef.current); }, [stopHr]);
+
+  return (
+    <div>
+      <p style={{ color: COLORS.textDim, fontFamily: "Inter, sans-serif", fontSize: 13.5, lineHeight: 1.6, maxWidth: 550 }}>
+        These are the two signals a phone genuinely has: motion (the
+        accelerometer) and an approximate heart-rate reading from the
+        camera and flash. Neither is brain activity — there's no EEG or
+        fMRI sensor in a phone, so nothing here is labeled as one.
+      </p>
+
+      <h3 style={{ fontFamily: "Fraunces, serif", fontWeight: 600, fontSize: 17, color: COLORS.text, marginTop: 22, marginBottom: 8 }}>Motion</h3>
+      <div style={{ background: COLORS.panelAlt, borderRadius: 4, padding: "16px 10px 6px" }}>
+        <ResponsiveContainer width="100%" height={140}>
+          <LineChart data={motionSeries}>
+            <CartesianGrid stroke={COLORS.line} strokeDasharray="2 6" vertical={false} />
+            <XAxis dataKey="i" hide />
+            <YAxis hide />
+            <Line dataKey="v" stroke={COLORS.signal} strokeWidth={1.5} dot={false} isAnimationActive={false} />
+          </LineChart>
+        </ResponsiveContainer>
+      </div>
+      <button
+        onClick={motionActive ? stopMotion : startMotion}
+        style={{
+          marginTop: 10,
+          background: motionActive ? "transparent" : COLORS.signal,
+          color: motionActive ? COLORS.text : "#08201C",
+          border: motionActive ? `1px solid ${COLORS.line}` : "none",
+          borderRadius: 3,
+          padding: "9px 16px",
+          fontFamily: "Inter, sans-serif",
+          fontWeight: 600,
+          fontSize: 13,
+          cursor: "pointer",
+        }}
+      >
+        {motionActive ? "Stop motion feed" : "Start motion feed"}
+      </button>
+      {motionError && <p style={{ color: "#F87171", fontSize: 12.5, marginTop: 8, fontFamily: "Inter, sans-serif" }}>{motionError}</p>}
+
+      <h3 style={{ fontFamily: "Fraunces, serif", fontWeight: 600, fontSize: 17, color: COLORS.text, marginTop: 28, marginBottom: 8 }}>Heart rate (camera)</h3>
+      <p style={{ color: COLORS.textDim, fontFamily: "Inter, sans-serif", fontSize: 12.5, lineHeight: 1.5, maxWidth: 480 }}>
+        Cover the rear camera and flash gently with a fingertip, then start —
+        it samples for 15 seconds. This is an approximate estimate, not a
+        medical device.
+      </p>
+      <video ref={videoRef} autoPlay muted playsInline style={{ display: "none" }} />
+      <canvas ref={canvasRef} style={{ display: "none" }} />
+      <button
+        onClick={startHr}
+        disabled={hrActive}
+        style={{
+          marginTop: 10,
+          background: hrActive ? "transparent" : COLORS.signal,
+          color: hrActive ? COLORS.text : "#08201C",
+          border: hrActive ? `1px solid ${COLORS.line}` : "none",
+          borderRadius: 3,
+          padding: "9px 16px",
+          fontFamily: "Inter, sans-serif",
+          fontWeight: 600,
+          fontSize: 13,
+          cursor: hrActive ? "default" : "pointer",
+          opacity: hrActive ? 0.6 : 1,
+        }}
+      >
+        {hrActive ? "Sampling… (15s)" : "Measure heart rate"}
+      </button>
+      {hrError && <p style={{ color: "#F87171", fontSize: 12.5, marginTop: 8, fontFamily: "Inter, sans-serif" }}>{hrError}</p>}
+      {bpm && (
+        <p style={{ marginTop: 10, fontFamily: "Fraunces, serif", fontSize: 20, color: COLORS.signal }}>
+          ~{bpm} bpm <span style={{ fontFamily: "Inter, sans-serif", fontSize: 12.5, color: COLORS.textDim }}>(approximate)</span>
+        </p>
+      )}
+    </div>
+  );
+}
+
+function Tab({ active, onClick, children }) {
+  return (
+    <button
+      onClick={onClick}
+      style={{
+        background: "transparent",
+        border: "none",
+        borderBottom: active ? `2px solid ${COLORS.signal}` : "2px solid transparent",
+        color: active ? COLORS.text : COLORS.textDim,
+        fontFamily: "Inter, sans-serif",
+        fontSize: 14,
+        fontWeight: 500,
+        padding: "10px 4px",
+        marginRight: 28,
+        cursor: "pointer",
+        letterSpacing: "0.01em",
+      }}
+    >
+      {children}
+    </button>
+  );
+}
+
+function SignalPanel() {
+  const [series, setSeries] = useNeuralSeries(60);
+  const [prediction, setPrediction] = useState([]);
+  const [running, setRunning] = useState(false);
+
+  useEffect(() => {
+    const id = setInterval(() => {
+      setSeries((prev) => {
+        const last = prev[prev.length - 1];
+        const t = (last.i + 1) / 6;
+        const v =
+          Math.sin(t) * 1.2 +
+          Math.sin(t * 2.7 + 1) * 0.6 +
+          Math.sin(t * 0.4) * 0.8 +
+          (Math.random() - 0.5) * 0.4;
+        const next = [...prev.slice(1), { i: last.i + 1, v: Number(v.toFixed(3)), kind: "observed" }];
+        return next;
+      });
+      setPrediction([]);
+    }, 900);
+    return () => clearInterval(id);
+  }, [setSeries]);
+
+  const handlePredict = () => {
+    setRunning(true);
+    setTimeout(() => {
+      const pred = extrapolate(series, 20);
+      setPrediction(pred);
+      pushLog("evolve:signals", { time: new Date().toLocaleTimeString(), note: "extrapolated 20 samples" });
+      setRunning(false);
+    }, 400);
+  };
+
+  const merged = [...series, ...prediction];
+
+  return (
+    <div>
+      <p style={{ color: COLORS.textDim, fontFamily: "Inter, sans-serif", fontSize: 13.5, lineHeight: 1.6, maxWidth: 520 }}>
+        This channel is a synthetic waveform, not a live EEG or fMRI feed —
+        there's no real sensor behind it. It's here to show where a genuine
+        signal-prediction model would sit in the pipeline. Press extrapolate
+        to project the trace forward.
+      </p>
+      <div style={{ marginTop: 18, background: COLORS.panelAlt, borderRadius: 4, padding: "18px 12px 8px" }}>
+        <ResponsiveContainer width="100%" height={220}>
+          <LineChart data={merged}>
+            <CartesianGrid stroke={COLORS.line} strokeDasharray="2 6" vertical={false} />
+            <XAxis dataKey="i" hide />
+            <YAxis hide domain={[-3, 3]} />
+            <Tooltip
+              contentStyle={{ background: COLORS.panel, border: `1px solid ${COLORS.line}`, borderRadius: 4 }}
+              labelStyle={{ display: "none" }}
+              itemStyle={{ color: COLORS.text, fontFamily: "IBM Plex Mono, monospace", fontSize: 12 }}
+            />
+            <Line
+              dataKey={(d) => (d.kind === "observed" ? d.v : null)}
+              stroke={COLORS.signal}
+              strokeWidth={1.5}
+              dot={false}
+              isAnimationActive={false}
+            />
+            <Line
+              dataKey={(d) => (d.kind === "predicted" ? d.v : null)}
+              stroke={COLORS.amber}
+              strokeWidth={1.5}
+              strokeDasharray="4 3"
+              dot={false}
+              isAnimationActive={false}
+            />
+          </LineChart>
+        </ResponsiveContainer>
+      </div>
+      <div style={{ display: "flex", alignItems: "center", gap: 16, marginTop: 14 }}>
+        <button
+          onClick={handlePredict}
+          disabled={running}
+          style={{
+            background: COLORS.signal,
+            color: "#08201C",
+            border: "none",
+            borderRadius: 3,
+            padding: "9px 16px",
+            fontFamily: "Inter, sans-serif",
+            fontWeight: 600,
+            fontSize: 13,
+            cursor: running ? "default" : "pointer",
+            opacity: running ? 0.6 : 1,
+          }}
+        >
+          {running ? "Extrapolating…" : "Extrapolate next 20 samples"}
+        </button>
+        <div style={{ display: "flex", gap: 14, fontFamily: "IBM Plex Mono, monospace", fontSize: 11.5, color: COLORS.textDim }}>
+          <span><span style={{ color: COLORS.signal }}>▬</span> observed</span>
+          <span><span style={{ color: COLORS.amber }}>▬</span> predicted</span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function LanguagePanel() {
+  const [input, setInput] = useState("The patient's readings suggest");
+  const [output, setOutput] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+  const [ground, setGround] = useState(false);
+
+  const run = async () => {
+    if (!input.trim()) return;
+    setLoading(true);
+    setError("");
+    setOutput("");
+    try {
+      let prompt = `Continue this passage naturally and plausibly, in 2-4 sentences, as a forward-looking prediction. Passage: "${input}"`;
+      if (ground) {
+        const observations = await readLog("evolve:observations");
+        if (observations.length > 0) {
+          prompt = `A camera just observed: "${observations[0].text}". Using that as context, continue this passage naturally and plausibly, in 2-4 sentences: "${input}"`;
+        }
+      }
+      const text = await callClaude(prompt);
+      setOutput(text);
+      pushLog("evolve:predictions", { time: new Date().toLocaleTimeString(), input, output: text, grounded: ground });
+    } catch (e) {
+      setError("Prediction failed — check your connection and try again.");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div>
+      <p style={{ color: COLORS.textDim, fontFamily: "Inter, sans-serif", fontSize: 13.5, lineHeight: 1.6, maxWidth: 520 }}>
+        This channel is real — it calls an LLM to extend whatever text you
+        give it. Use it for report drafting, scenario continuation, or
+        next-likely-outcome framing.
+      </p>
+      <label style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 14, fontFamily: "Inter, sans-serif", fontSize: 12.5, color: COLORS.textDim, cursor: "pointer" }}>
+        <input type="checkbox" checked={ground} onChange={(e) => setGround(e.target.checked)} />
+        Ground in latest Perception observation
+      </label>
+      <textarea
+        value={input}
+        onChange={(e) => setInput(e.target.value)}
+        rows={3}
+        style={{
+          width: "100%",
+          marginTop: 16,
+          background: COLORS.panelAlt,
+          border: `1px solid ${COLORS.line}`,
+          borderRadius: 4,
+          color: COLORS.text,
+          fontFamily: "IBM Plex Mono, monospace",
+          fontSize: 13,
+          padding: 12,
+          resize: "vertical",
+          boxSizing: "border-box",
+        }}
+      />
+      <button
+        onClick={run}
+        disabled={loading}
+        style={{
+          marginTop: 10,
+          background: COLORS.signal,
+          color: "#08201C",
+          border: "none",
+          borderRadius: 3,
+          padding: "9px 16px",
+          fontFamily: "Inter, sans-serif",
+          fontWeight: 600,
+          fontSize: 13,
+          cursor: loading ? "default" : "pointer",
+          opacity: loading ? 0.6 : 1,
+        }}
+      >
+        {loading ? "Predicting…" : "Predict continuation"}
+      </button>
+      {error && (
+        <p style={{ color: "#F87171", fontFamily: "Inter, sans-serif", fontSize: 13, marginTop: 12 }}>{error}</p>
+      )}
+      {output && (
+        <div
+          style={{
+            marginTop: 16,
+            background: COLORS.panelAlt,
+            borderLeft: `2px solid ${COLORS.signal}`,
+            padding: "12px 16px",
+            fontFamily: "Fraunces, serif",
+            fontSize: 15,
+            lineHeight: 1.65,
+            color: COLORS.text,
+          }}
+        >
+          {output}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ArchitecturePanel() {
+  const rows = [
+    { stage: "Perceive", detail: "Camera frame sampled every few seconds, sent to a vision model — the real, buildable version of 'continuous surroundings awareness'" },
+    { stage: "Sense", detail: "Real phone sensors — accelerometer motion and camera-based heart-rate estimate. Not brain signals; a phone has no EEG/fMRI hardware" },
+    { stage: "Ingest", detail: "Raw channel input — synthetic here; would be EEG/fMRI/BCI hardware in a real deployment" },
+    { stage: "Normalize", detail: "Windowing, denoising, and feature extraction on the incoming signal" },
+    { stage: "Model", detail: "A trained signal-prediction model for waveform tasks; an LLM (this demo) for language tasks" },
+    { stage: "Serve", detail: "React front end + API layer; results rendered live, as in the two tabs beside this one" },
+    { stage: "Store", detail: "Session state now; a real backend/database for persistence and multi-user history" },
+  ];
+  return (
+    <div>
+      <p style={{ color: COLORS.textDim, fontFamily: "Inter, sans-serif", fontSize: 13.5, lineHeight: 1.6, maxWidth: 560 }}>
+        Both tabs share one shape: input → model → prediction → display. The
+        table below is that pipeline, stage by stage, so a real signal source
+        could be swapped in without changing the rest of the app.
+      </p>
+      <div style={{ marginTop: 18 }}>
+        {rows.map((r, idx) => (
+          <div
+            key={r.stage}
+            style={{
+              display: "flex",
+              gap: 18,
+              padding: "12px 0",
+              borderTop: idx === 0 ? `1px solid ${COLORS.line}` : "none",
+              borderBottom: `1px solid ${COLORS.line}`,
+            }}
+          >
+            <div style={{ width: 90, flexShrink: 0, fontFamily: "IBM Plex Mono, monospace", fontSize: 12, color: COLORS.signal }}>
+              {r.stage}
+            </div>
+            <div style={{ fontFamily: "Inter, sans-serif", fontSize: 13.5, color: COLORS.text, lineHeight: 1.5 }}>
+              {r.detail}
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+export default function BrainPredictApp() {
+  const [tab, setTab] = useState("signal");
+
+  return (
+    <div style={{ background: COLORS.bg, minHeight: "100vh", fontFamily: "Inter, sans-serif" }}>
+      <style>{FONT_IMPORT}</style>
+      <div style={{ maxWidth: 720, margin: "0 auto", padding: "40px 20px 60px" }}>
+        <header style={{ marginBottom: 6 }}>
+          <div style={{ fontFamily: "IBM Plex Mono, monospace", fontSize: 11.5, color: COLORS.signalDim, letterSpacing: "0.04em" }}>
+            brainpredict.ai
+          </div>
+          <h1
+            style={{
+              fontFamily: "Fraunces, serif",
+              fontWeight: 600,
+              fontSize: 34,
+              color: COLORS.text,
+              margin: "6px 0 4px",
+              lineHeight: 1.15,
+            }}
+          >
+            One pipeline, two kinds of forecasting.
+          </h1>
+          <p style={{ color: COLORS.textDim, fontSize: 14, maxWidth: 480, lineHeight: 1.6 }}>
+            A signal channel and a language channel, side by side, built on
+            the same input → model → prediction shape.
+          </p>
+        </header>
+
+        <div style={{ display: "flex", borderBottom: `1px solid ${COLORS.line}`, marginTop: 28, marginBottom: 24 }}>
+          <Tab active={tab === "signal"} onClick={() => setTab("signal")}>Signal</Tab>
+          <Tab active={tab === "language"} onClick={() => setTab("language")}>Language</Tab>
+          <Tab active={tab === "perception"} onClick={() => setTab("perception")}>Perception</Tab>
+          <Tab active={tab === "phone"} onClick={() => setTab("phone")}>Phone Sensors</Tab>
+          <Tab active={tab === "evolve"} onClick={() => setTab("evolve")}>Evolve</Tab>
+          <Tab active={tab === "architecture"} onClick={() => setTab("architecture")}>Architecture</Tab>
+        </div>
+
+        {tab === "signal" && <SignalPanel />}
+        {tab === "language" && <LanguagePanel />}
+        {tab === "perception" && <PerceptionPanel />}
+        {tab === "phone" && <PhoneSensorsPanel />}
+        {tab === "evolve" && <EvolvePanel />}
+        {tab === "architecture" && <ArchitecturePanel />}
+      </div>
+    </div>
+  );
+}
